@@ -1,3 +1,7 @@
+#git add .
+#git commit -m "Add frontier detection"
+#git push
+
 import websocket
 import threading
 import json
@@ -5,6 +9,8 @@ import time
 import numpy as np
 from numba import njit
 import cv2
+import heapq
+import math
 
 ipAddress = "ws://localhost:9000"
 wsConnected = False
@@ -13,28 +19,60 @@ sensorData = []
 leftEncoder = 0
 rightEncoder = 0
 yawDelta = 0
+startrecieved = False
+startAngle = 0.0
 
 currentLeftVel = 0.0
 currentRightVel = 0.0
 wheeldiameter = 20.0
-wheelbase = 100
+wheelbase = 100.0
+botRadius = 50
+clearance = botRadius + 5
+planningClearance = botRadius + 20
 ticksPerRev = 100
 distancePerTick = np.pi * wheeldiameter / ticksPerRev
 maxVelChange = 2.0
-MaxWheelVel = 20.0
+maxWheelVel = 20.0
+testWheelVel = 80.0
+speedPrevLeft = 0
+speedPrevRight = 0
+speedPrevTime = 0.0
 
 mapSize = 2440
 worldMap = np.zeros((mapSize, mapSize), dtype=np.uint8)
+frontierMask = np.zeros((mapSize, mapSize), dtype=np.uint8)
+frontierTarget = None
+updateCounter = 0
 
-robotX = mapSize // 2
-robotY = mapSize // 2
+planningEvent = threading.Event()
+pathLock = threading.Lock()
+mapLock = threading.Lock()
+currentPath = np.empty((0, 2), dtype=np.int32)
+
+robotX = 0.0
+robotY = 0.0
 robotAngle = 0.0
-
 prevLeftEncoder = 0
 prevRightEncoder = 0
 
+waypointIndex = 0
+waypointTolerance = 8.0
+lookAhead = 30
+linearGain = 0.8
+angularGain = 3.0
+
+testMode = False
+
+photo = cv2.imread("bot.png", cv2.IMREAD_UNCHANGED)
+
 def limitVelocity(current, target):
-    target = np.clip(target, -MaxWheelVel, MaxWheelVel)
+    global testWheelVel, maxWheelVel
+
+    if testMode:
+        maxVel = testWheelVel
+    else:
+        maxVel = maxWheelVel
+    target = np.clip(target, -maxVel, maxVel)
 
     difference = target - current
     difference = np.clip(
@@ -51,27 +89,124 @@ def onOpen (ws):
     wsConnected = True
     wsInstance = ws
 
-def onMessage (ws, message):
-    global sensorData, leftEncoder, rightEncoder, yawDelta
-    data = json.loads (message)
-    if data.get ("type") == "DATA":
-        sensorData = data.get ("sensor", [])
-        leftEncoder = data.get ("leftEncoder", 0)
-        rightEncoder = data.get ("rightEncoder", 0)
-        yawDelta = data.get ("yawDelta", 0)
-        dtime = data.get("dt", 0)
-        #print (leftEncoder,rightEncoder,yawDelta, sensorData, dtime)
+def onMessage(ws, message):
+    global sensorData, startrecieved, leftEncoder, rightEncoder, yawDelta, updateCounter, frontierMask
+    global robotX, robotY, robotAngle, startAngle, speedPrevRight, speedPrevLeft, speedPrevTime
+
+    data = json.loads(message)
+
+    now = time.time()
+
+    if data.get("type") == "DEBUG":
+        if not startrecieved:
+            robotX = data["x"]
+            robotY = data["y"]
+            theta = data["theta"]
+            startAngle = np.deg2rad(theta)
+            robotAngle = startAngle
+            print("Starting position: ", robotX, robotY, theta)
+            startrecieved = True
+
+        return
+
+    if data.get("type") != "DATA":
+        return
+    if not startrecieved:
+        return
+        
+    sensorData = data.get("sensor", [])
+    leftEncoder = data.get("leftEncoder", 0)
+    rightEncoder = data.get("rightEncoder", 0)
+    yawDelta = data.get("yawDelta", 0)
+
+    dt = data.get("dt", 0)
+
+    with mapLock:
 
         updatePosition(leftEncoder, rightEncoder, yawDelta)
-        updateMap(sensorData)
-        frontiers = findFrontiers()
-        displayMap()
-        print(
-            "yaw deg:", round(yawDelta, 3),
-            "angle rad:", round(robotAngle, 4),
-            "robot:", round(robotX, 2), round(robotY, 2),
-            "mapped:", np.count_nonzero(worldMap)
+
+        sensorArray = np.asarray(sensorData,dtype=np.float64)
+
+        updateMapNumba(
+            worldMap,
+            sensorArray,
+            robotX,
+            robotY,
+            robotAngle,
+            mapSize
         )
+
+        updateCounter += 1
+
+        if updateCounter % 10 == 0:
+            frontierMask = findFrontiersNumba(
+                worldMap
+            )
+
+    if updateCounter % 100 == 0:
+        planningEvent.set()
+
+def plannerLoop():
+    global currentPath, waypointIndex, frontierTarget
+
+    while True:
+
+        # Sleep here until somebody asks for a replan
+        planningEvent.wait()
+        planningEvent.clear()
+
+        print("Replanning...")
+
+        # Snapshot everything needed by A*
+        with mapLock:
+            mapCopy = worldMap.copy()
+            frontierCopy = frontierMask.copy()
+            startX = int(round(robotX))
+            startY = int(round(robotY))
+
+        planningMap = createPlanningMap(mapCopy)
+
+        # Keep old target if still valid
+        if (
+            frontierTarget is not None
+            and checkTarget(
+                frontierTarget,
+                frontierCopy,
+                planningMap
+            )
+        ):
+            target = frontierTarget
+
+        else:
+            target = chooseFrontier(
+                frontierCopy,
+                planningMap,
+                startX,
+                startY
+            )
+
+        if target is None:
+            print("No frontier available")
+            continue
+
+        startTime = time.time()
+
+        newPath = localAStar(planningMap, (startX, startY), target)
+        newPath = simplifyPath(newPath)
+
+        print("A* took", round(time.time() - startTime, 3), "seconds")
+
+        if len(newPath) > 0:
+
+            newPath = simplifyPath(newPath)
+
+            # Very short critical section
+            with pathLock:
+                currentPath = newPath
+                waypointIndex = 0
+                frontierTarget = target
+
+            print("New path:", len(newPath), "points")
 
 def onClose (ws, code, reason):
     global wsConnected
@@ -91,27 +226,36 @@ def runWS ():
     )
     ws.run_forever ()
 
-@njit
-def updateMapNumba(sensorData):
-    global worldMap, robotX, robotY, robotAngle
+@njit(nogil=True, cache=True)
+def updateMapNumba(worldMap, sensorData, robotX, robotY, robotAngle, mapSize):
 
-    for i, distance in enumerate(sensorData):
-        angle = robotAngle + i * (2 * np.pi / len(sensorData))
+    n = len(sensorData)
 
+    for i in range(n):
+        distance = sensorData[i]
+
+        angle = robotAngle + i * (2.0 * np.pi / n)
+
+        cosA = np.cos(angle)
+        sinA = np.sin(angle)
+
+        # Mark free space along lidar ray
         for d in range(int(distance)):
-            x = int(robotX + d * np.cos(angle))
-            y = int(robotY - d * np.sin(angle))
+            x = int(robotX + d * cosA)
+            y = int(robotY - d * sinA)
+
             if 0 <= x < mapSize and 0 <= y < mapSize:
                 if worldMap[y, x] != 2:
                     worldMap[y, x] = 1
 
-        # If sensor actually hit something, mark obstacle
+        # Mark obstacle
         if distance < 500:
-            endX = int(robotX + distance * np.cos(angle))
-            endY = int(robotY - distance * np.sin(angle))
+            endX = int(robotX + distance * cosA)
+            endY = int(robotY - distance * sinA)
 
             if 0 <= endX < mapSize and 0 <= endY < mapSize:
                 worldMap[endY, endX] = 2
+
 
 def updatePosition(leftEncoder, rightEncoder, yawDelta):
     global robotX, robotY, robotAngle, prevLeftEncoder, prevRightEncoder
@@ -125,14 +269,64 @@ def updatePosition(leftEncoder, rightEncoder, yawDelta):
     deltaLeft = deltaLeftTicks * distancePerTick
     deltaRight = deltaRightTicks * distancePerTick
 
-    robotAngle = np.deg2rad(yawDelta)
+    robotAngle = np.deg2rad(yawDelta) + startAngle
+    robotAngle = np.arctan2(np.sin(robotAngle), np.cos(robotAngle))
     distanceMoved = (deltaLeft + deltaRight) /2
 
     robotX += distanceMoved * np.cos(robotAngle)
     robotY -= distanceMoved * np.sin(robotAngle)
 
-def displayMap():
+    robotX = np.clip(robotX, botRadius, mapSize - botRadius - 1)
+    robotY = np.clip(robotY, botRadius, mapSize - botRadius - 1)
 
+
+def createPlanningMap(mapData):
+
+    # Actual known obstacles
+    obstacleMask = (mapData == 2).astype(np.uint8)
+
+    kernelSize = 2 * planningClearance + 1
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernelSize, kernelSize))
+
+    inflatedObstacles = cv2.dilate(obstacleMask, kernel)
+
+    # Unknown space must also be blocked
+    planningMap = np.zeros_like(mapData, dtype=np.uint8)
+
+    planningMap[mapData == 0] = 1
+    planningMap[inflatedObstacles == 1] = 1
+
+    planningMap[:planningClearance, :] = 1
+    planningMap[-planningClearance:, :] = 1
+    planningMap[:, :planningClearance] = 1
+    planningMap[:, -planningClearance:] = 1
+
+    return planningMap
+
+
+def checkTarget(target, frontierMask, planningMap):
+
+    if target is None:
+        return False
+
+    x, y = target
+
+    if not (0 <= x < mapSize and 0 <= y < mapSize):
+        return False
+
+    if frontierMask[y, x] != 1:
+        return False
+
+    if planningMap[y, x] == 1:
+        return False
+
+    return True
+
+
+def displayMap():
+    global currentRightVel, currentLeftVel, testMode, robotAngle
+    
     display = np.zeros((mapSize, mapSize, 3), dtype=np.uint8)
 
     # Unknown = dark
@@ -141,61 +335,536 @@ def displayMap():
     display[worldMap == 1] = (255, 255, 255)
     # Obstacles = red
     display[worldMap == 2] = (0, 0, 255)
+    display[frontierMask == 1] = (255, 0, 0)
 
-    frontiers = findFrontiers()
-    for x, y in frontiers:
-        display[y, x] = (255,0,0)
+    if currentPath is not None and len(currentPath) > 0:
+        for x, y in currentPath[::5]:
+            cv2.circle(display, (x,y), 2, (255,0,255), -1)
 
+    if frontierTarget is not None:
+        cv2.circle(display, frontierTarget, 15, (0,255,255),-1)
 
-    cv2.circle(display, (int(robotX), int(robotY)), 8, (0,255,0), -1)
+    if photo is not None:
+        bot = cv2.resize(photo, (100, 100))
+        x = int(robotX - 50)
+        y = int(robotY - 50)
+        circleMask = np.zeros((100, 100), dtype=np.uint8)
+        cv2.circle(circleMask, (50, 50), 50, 255, -1)
 
-    displaySmall = cv2.resize(display, (610, 610))
+        if bot.shape[2] == 4:
+            mask = cv2.bitwise_and(bot[:, :, 3], circleMask)
+            cv2.copyTo(bot[:, :, :3], mask, display[y:y + 100, x:x + 100])
+        else:
+            cv2.copyTo(bot, circleMask, display[y:y + 100, x:x + 100])
+    #cv2.circle(display, (int(robotX), int(robotY)), 50, (0,255,0), -1)
+
+    arrowLength = 100
+    startPoint = (int(robotX), int(robotY))
+    endPoint = (
+        int(robotX + arrowLength * np.cos(robotAngle)),
+        int(robotY - arrowLength * np.sin(robotAngle)))
+    cv2.line(display, startPoint, endPoint, (0, 0, 0), 4)
+
+    displaySmall = cv2.resize(display, (1000, 1000))
+    cv2.putText(displaySmall,f"Left wheel: {currentLeftVel:.2f} rad/s",(20, 30),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0, 0, 255),2)
+    cv2.putText(displaySmall,f"right wheel: {currentRightVel:.2f} rad/s",(20, 60),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0, 0, 255),2)
+    cv2.putText(displaySmall,f"heading: {np.rad2deg(robotAngle):.2f} degrees",(20, 90),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0, 0, 255),2)
+
     cv2.imshow("Robot Map", displaySmall)
-    cv2.waitKey(1)
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('t'):
+        testMode = not testMode
+        if testMode:
+            print("Super Duper fast")
+        else:
+            print("normal speed")
 
 
 
-def findFrontiers():
-    frontiers = []
+@njit(nogil=True, cache=True)
+def findFrontiersNumba(worldMap):
+    height, width = worldMap.shape
 
-    for y in range(1, mapSize - 1):
-        for x in range(1, mapSize - 1):
+    frontierMask = np.zeros((height, width), dtype=np.uint8)
 
-            # Must already be known free space
+    for y in range(1, height - 1):
+        for x in range(1, width - 1):
+
             if worldMap[y, x] != 1:
                 continue
 
-            # Look at 8 neighbouring cells
-            neighbours = worldMap[y-1:y+2, x-1:x+2]
+            foundUnknown = False
 
-            # If any neighbour is unknown, this is a frontier
-            if np.any(neighbours == 0):
-                frontiers.append((x, y))
+            for dy in range(-1, 2):
+                for dx in range(-1, 2):
 
-    return frontiers
+                    if dx == 0 and dy == 0:
+                        continue
+
+                    if worldMap[y + dy, x + dx] == 0:
+                        foundUnknown = True
+                        break
+
+                if foundUnknown:
+                    break
+
+            if foundUnknown:
+                frontierMask[y, x] = 1
+
+    return frontierMask
+
+def chooseFrontier(frontierMask, planningMap, robotX, robotY):
+
+    numLabels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        frontierMask,
+        connectivity=8
+    )
+
+    bestTarget = None
+    bestScore = float("inf")
+
+    for label in range(1, numLabels):
+
+        area = stats[label, cv2.CC_STAT_AREA]
+
+        if area < 10:
+            continue
+
+        ys, xs = np.where(labels == label)
+
+        if len(xs) == 0:
+            continue
+
+        cx, cy = centroids[label]
+
+        distToCentre = ((xs - cx) ** 2 + (ys - cy) ** 2)
+
+        index = np.argmin(distToCentre)
+
+        tx = int(xs[index])
+        ty = int(ys[index])
+
+        # Skip targets inside inflated obstacle area
+        if planningMap[ty, tx] == 1:
+            continue
+
+        distance = np.hypot(
+            tx - robotX,
+            ty - robotY
+        )
+
+        if distance < bestScore:
+            bestScore = distance
+            bestTarget = (tx, ty)
+
+    return bestTarget
+
+@njit(nogil=True, cache=True)
+def astarNumba(planningMap, startX, startY, goalX, goalY):
+
+    height, width = planningMap.shape
+
+    # Check bounds
+    if startX < 0 or startX >= width or startY < 0 or startY >= height:
+        return np.empty((0, 2), dtype=np.int32)
+
+    if goalX < 0 or goalX >= width or goalY < 0 or goalY >= height:
+        return np.empty((0, 2), dtype=np.int32)
+
+    # Start and goal must be free
+    if planningMap[startY, startX] == 1:
+        return np.empty((0, 2), dtype=np.int32)
+
+    if planningMap[goalY, goalX] == 1:
+        return np.empty((0, 2), dtype=np.int32)
+
+    gcostgrid = np.full(
+        (height, width),
+        np.inf,
+        dtype=np.float32
+    )
+
+    closed = np.zeros(
+        (height, width),
+        dtype=np.uint8
+    )
+
+    parentX = np.full(
+        (height, width),
+        -1,
+        dtype=np.int32
+    )
+
+    parentY = np.full(
+        (height, width),
+        -1,
+        dtype=np.int32
+    )
+
+    # 8-connected movement
+    moveX = np.array(
+        [0, 1, 1, -1, 0, -1, -1, 1],
+        dtype=np.int32
+    )
+
+    moveY = np.array(
+        [1, 0, 1, 0, -1, -1, 1, -1],
+        dtype=np.int32
+    )
+
+    costs = np.array(
+        [
+            1.0,
+            1.0,
+            1.41421356,
+            1.0,
+            1.0,
+            1.41421356,
+            1.41421356,
+            1.41421356
+        ],
+        dtype=np.float32
+    )
+
+    gcostgrid[startY, startX] = 0.0
+
+    dx = abs(goalX - startX)
+    dy = abs(goalY - startY)
+
+    hcost = (
+        max(dx, dy)
+        + (1.41421356 - 1.0) * min(dx, dy)
+    )
+
+    # Numba supports heapq.
+    # Seed it immediately so the heap type can be inferred.
+    openList = [(hcost, startX, startY)]
+
+    pathFound = False
+
+    while len(openList) > 0:
+
+        _, currentX, currentY = heapq.heappop(openList)
+
+        if closed[currentY, currentX] == 1:
+            continue
+
+        closed[currentY, currentX] = 1
+
+        if currentX == goalX and currentY == goalY:
+            pathFound = True
+            break
+
+        currentG = gcostgrid[currentY, currentX]
+
+        for i in range(8):
+
+            nextX = currentX + moveX[i]
+            nextY = currentY + moveY[i]
+
+            # Bounds
+            if (
+                nextX < 0 or nextX >= width or
+                nextY < 0 or nextY >= height
+            ):
+                continue
+
+            # Blocked
+            if planningMap[nextY, nextX] == 1:
+                continue
+
+            # Already closed
+            if closed[nextY, nextX] == 1:
+                continue
+
+            tentativeG = currentG + costs[i]
+
+            if tentativeG < gcostgrid[nextY, nextX]:
+
+                gcostgrid[nextY, nextX] = tentativeG
+
+                parentX[nextY, nextX] = currentX
+                parentY[nextY, nextX] = currentY
+
+                dx = abs(goalX - nextX)
+                dy = abs(goalY - nextY)
+
+                hcost = (
+                    max(dx, dy)
+                    + (1.41421356 - 1.0) * min(dx, dy)
+                )
+
+                fcost = tentativeG + hcost
+
+                heapq.heappush(
+                    openList,
+                    (fcost, nextX, nextY)
+                )
+
+    if not pathFound:
+        return np.empty((0, 2), dtype=np.int32)
+
+    pathLength = 1
+
+    x = goalX
+    y = goalY
+
+    while x != startX or y != startY:
+
+        px = parentX[y, x]
+        py = parentY[y, x]
+
+        if px == -1 or py == -1:
+            return np.empty((0, 2), dtype=np.int32)
+
+        x = px
+        y = py
+
+        pathLength += 1
+
+    path = np.empty(
+        (pathLength, 2),
+        dtype=np.int32
+    )
+
+    x = goalX
+    y = goalY
+
+    index = pathLength - 1
+
+    while True:
+
+        path[index, 0] = x
+        path[index, 1] = y
+
+        if x == startX and y == startY:
+            break
+
+        px = parentX[y, x]
+        py = parentY[y, x]
+
+        x = px
+        y = py
+
+        index -= 1
+
+    return path
+
+def localAStar(planningMap, start, goal, margin=250):
+
+    startX, startY = start
+    goalX, goalY = goal
+
+    minX = max(0, min(startX, goalX) - margin)
+    maxX = min(mapSize, max(startX, goalX) + margin + 1)
+
+    minY = max(0, min(startY, goalY) - margin)
+    maxY = min(mapSize, max(startY, goalY) + margin + 1)
+
+    localMap = planningMap[minY:maxY, minX:maxX]
+
+    localStartX = startX - minX
+    localStartY = startY - minY
+
+    localGoalX = goalX - minX
+    localGoalY = goalY - minY
+
+    localPath = astarNumba(
+        localMap,
+        localStartX,
+        localStartY,
+        localGoalX,
+        localGoalY
+    )
+
+    if len(localPath) == 0:
+        return np.empty((0, 2), dtype=np.int32)
+
+    # Convert back to full-map coordinates
+    localPath[:, 0] += minX
+    localPath[:, 1] += minY
+
+    return localPath
+
+def simplifyPath(path):
+
+    if path is None or len(path) < 3:
+        return path
+
+    simplified = [path[0]]
+
+    previousDirection = None
+
+    for i in range(1, len(path)):
+
+        dx = path[i][0] - path[i - 1][0]
+        dy = path[i][1] - path[i - 1][1]
+
+        direction = (
+            np.sign(dx),
+            np.sign(dy)
+        )
+
+        if previousDirection is None:
+            previousDirection = direction
+
+        elif direction != previousDirection:
+
+            # Save point immediately before direction changed
+            simplified.append(path[i - 1])
+
+            previousDirection = direction
+
+    # Always include goal
+    simplified.append(path[-1])
+
+    return np.asarray(
+        simplified,
+        dtype=np.int32
+    )
+
+def getObstacleDistance(x, y, worldMap, searchRadius=100):
+
+    x = int(round(x))
+    y = int(round(y))
+
+    minX = max(0, x - searchRadius)
+    maxX = min(mapSize, x + searchRadius + 1)
+
+    minY = max(0, y - searchRadius)
+    maxY = min(mapSize, y + searchRadius + 1)
+
+    region = worldMap[minY:maxY, minX:maxX]
+
+    obstaclePoints = np.argwhere(region == 2)
+
+    if len(obstaclePoints) == 0:
+        return searchRadius
+
+    robotLocalX = x - minX
+    robotLocalY = y - minY
+
+    dy = obstaclePoints[:, 0] - robotLocalY
+    dx = obstaclePoints[:, 1] - robotLocalX
+
+    distances = np.sqrt(dx * dx + dy * dy)
+
+    return np.min(distances)
     
-    
+def followPath():
+    global waypointIndex
 
+    with pathLock:
+        path = currentPath
+        localWaypointIndex = waypointIndex
+
+    if path is None or len(path) == 0:
+        return 0.0, 0.0
+
+    if localWaypointIndex >= len(path) - 1:
+        return 0.0, 0.0
+
+    cornerTolerance = 20.0
+
+    # Skip waypoints already reached
+    while localWaypointIndex < len(path) - 1:
+
+        targetIndex = localWaypointIndex + 1
+        targetX, targetY = path[targetIndex]
+
+        dx = targetX - robotX
+        dy = robotY - targetY
+
+        distanceToTarget = np.hypot(dx, dy)
+
+        if distanceToTarget >= cornerTolerance:
+            break
+
+        localWaypointIndex = targetIndex
+
+        with pathLock:
+            waypointIndex = localWaypointIndex
+
+    # Final waypoint reached
+    if localWaypointIndex >= len(path) - 1:
+        return 0.0, 0.0
+
+    # Desired heading to next simplified waypoint
+    desiredHeading = np.arctan2(dy, dx)
+
+    headingError = np.arctan2(
+        np.sin(desiredHeading - robotAngle),
+        np.cos(desiredHeading - robotAngle)
+    )
+
+    headingAbs = abs(headingError)
+
+    maxVel = testWheelVel if testMode else maxWheelVel
+
+    if headingAbs > np.deg2rad(100):
+
+        turnSpeed = min(20.0, maxVel)
+
+        if headingError > 0:
+            leftWheel = -turnSpeed
+            rightWheel = turnSpeed
+        else:
+            leftWheel = turnSpeed
+            rightWheel = -turnSpeed
+
+    else:
+
+        # Full speed when aligned.
+        # Progressively slower for larger turns.
+        forwardScale = max(0.25, np.cos(headingError))
+        baseSpeed = maxVel * forwardScale
+
+        # Stronger steering than before
+        steeringGain = 6.0
+        correction = steeringGain * headingError
+
+        leftWheel = baseSpeed - correction
+        rightWheel = baseSpeed + correction
+
+    largest = max(
+        abs(leftWheel),
+        abs(rightWheel)
+    )
+
+    if largest > maxVel:
+        scale = maxVel / largest
+        leftWheel *= scale
+        rightWheel *= scale
+
+    return leftWheel, rightWheel
 
 
 threading.Thread(target=runWS, daemon=True).start()
+threading.Thread(target=plannerLoop, daemon=True).start()
 while not wsConnected:
     time.sleep (0.1)
 
+lastDisplay = 0.0
+
 try:
     while True:
-        targetLeftVel = 15
-        targetRightVel = 20
+        targetLeftVel, targetRightVel = followPath()
 
         currentLeftVel = limitVelocity(currentLeftVel, targetLeftVel)
         currentRightVel = limitVelocity(currentRightVel, targetRightVel)
+
+
         
         if wsInstance:
             try:
                 wsInstance.send(f"MOVE {currentLeftVel} {currentRightVel}")
             except Exception as e:
                 print ("Sending failed", e)
-        time.sleep (1/15.0)
+
+        if time.time() - lastDisplay > 0.1:
+            displayMap()
+            lastDisplay = time.time()
+        time.sleep (1/50.0)
 
 except KeyboardInterrupt:
     print ("Exiting")
