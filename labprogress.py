@@ -43,6 +43,8 @@ worldMap = np.zeros((mapSize, mapSize), dtype=np.uint8)
 frontierMask = np.zeros((mapSize, mapSize), dtype=np.uint8)
 frontierTarget = None
 updateCounter = 0
+explorationComplete = False
+noFrontier = 0
 
 planningEvent = threading.Event()
 pathLock = threading.Lock()
@@ -143,11 +145,11 @@ def onMessage(ws, message):
                 worldMap
             )
 
-    if updateCounter % 100 == 0:
+    if updateCounter % 100 == 0 and not explorationComplete:
         planningEvent.set()
 
 def plannerLoop():
-    global currentPath, waypointIndex, frontierTarget
+    global currentPath, waypointIndex, frontierTarget, now, explorationComplete, noFrontier
 
     while True:
 
@@ -186,9 +188,19 @@ def plannerLoop():
             )
 
         if target is None:
+            noFrontier += 1
             print("No frontier available")
+            if noFrontier >= 3:
+                explorationComplete
+                with pathLock:
+                    currentPath = np.empty((0,2),dtype=np.int32)
+                    waypointIndex = 0
+                duration = time.time() - now
+                print("map fully explored, it took : ", round(duration,2), " seconds" )
+
             continue
 
+        noFrontier = 0
         startTime = time.time()
 
         newPath = localAStar(planningMap, (startX, startY), target)
@@ -338,8 +350,16 @@ def displayMap():
     display[frontierMask == 1] = (255, 0, 0)
 
     if currentPath is not None and len(currentPath) > 0:
-        for x, y in currentPath[::5]:
-            cv2.circle(display, (x,y), 2, (255,0,255), -1)
+        for i in range(len(currentPath) - 1):
+            x1, y1 = currentPath[i]
+            x2, y2 = currentPath[i + 1]
+            cv2.line(
+                display,
+                (int(x1), int(y1)),
+                (int(x2), int(y2)),
+                (255, 0, 255),
+                3
+            )
 
     if frontierTarget is not None:
         cv2.circle(display, frontierTarget, 15, (0,255,255),-1)
@@ -752,8 +772,11 @@ def getObstacleDistance(x, y, worldMap, searchRadius=100):
     return np.min(distances)
     
 def followPath():
-    global waypointIndex
+    global waypointIndex, explorationComplete
 
+    if explorationComplete:
+        return 0.0, 0.0
+    
     with pathLock:
         path = currentPath
         localWaypointIndex = waypointIndex
@@ -796,40 +819,43 @@ def followPath():
         np.sin(desiredHeading - robotAngle),
         np.cos(desiredHeading - robotAngle)
     )
-
     headingAbs = abs(headingError)
-
     maxVel = testWheelVel if testMode else maxWheelVel
+    obstacleDistance = getObstacleDistance(robotX, robotY, worldMap)
+    closeToObstacle = obstacleDistance < 90
 
-    if headingAbs > np.deg2rad(100):
 
-        turnSpeed = min(20.0, maxVel)
+    if closeToObstacle and headingAbs > np.deg2rad(15) or headingAbs > np.deg2rad(100):
 
-        if headingError > 0:
-            leftWheel = -turnSpeed
-            rightWheel = turnSpeed
+        # Near obstacles: turn safely on the spot if needed
+        turnThreshold = np.deg2rad(15)
+        if headingAbs > turnThreshold:
+            turnSpeed = 20.0
+            if headingError > 0:
+                leftWheel = -turnSpeed
+                rightWheel = turnSpeed
+            else:
+                leftWheel = turnSpeed
+                rightWheel = -turnSpeed
         else:
-            leftWheel = turnSpeed
-            rightWheel = -turnSpeed
+            # Once aligned, move forward cautiously
+            baseSpeed = 8.0
+            steeringGain = 3.0
+            correction = steeringGain * headingError
+            leftWheel = baseSpeed - correction
+            rightWheel = baseSpeed + correction
 
     else:
 
-        # Full speed when aligned.
-        # Progressively slower for larger turns.
-        forwardScale = max(0.25, np.cos(headingError))
+        # Open space: keep moving while turning
+        forwardScale = np.cos(headingError)
         baseSpeed = maxVel * forwardScale
-
-        # Stronger steering than before
         steeringGain = 6.0
         correction = steeringGain * headingError
-
         leftWheel = baseSpeed - correction
         rightWheel = baseSpeed + correction
 
-    largest = max(
-        abs(leftWheel),
-        abs(rightWheel)
-    )
+    largest = max(abs(leftWheel), abs(rightWheel))
 
     if largest > maxVel:
         scale = maxVel / largest
@@ -846,26 +872,35 @@ while not wsConnected:
 
 lastDisplay = 0.0
 
+updateTime = time.perf_counter()
+lastUpdate = time.perf_counter()
+timeInterval = 1/15
+
 try:
     while True:
-        targetLeftVel, targetRightVel = followPath()
 
-        currentLeftVel = limitVelocity(currentLeftVel, targetLeftVel)
-        currentRightVel = limitVelocity(currentRightVel, targetRightVel)
+        currentTime = time.perf_counter()
+
+        if currentTime - updateTime >= timeInterval:
+
+            targetLeftVel, targetRightVel = followPath()
+
+            currentLeftVel = limitVelocity(currentLeftVel, targetLeftVel)
+            currentRightVel = limitVelocity(currentRightVel, targetRightVel)
+
+            updateTime += timeInterval
+
+            if wsInstance:
+                try:
+                    wsInstance.send(f"MOVE {currentLeftVel} {currentRightVel}")
+                except Exception as e:
+                    print ("Sending failed", e)
 
 
-        
-        if wsInstance:
-            try:
-                wsInstance.send(f"MOVE {currentLeftVel} {currentRightVel}")
-            except Exception as e:
-                print ("Sending failed", e)
 
-        if time.time() - lastDisplay > 0.1:
+        if currentTime - lastDisplay >= 0.1:
             displayMap()
-            lastDisplay = time.time()
-        time.sleep (1/50.0)
-
+            lastDisplay += 0.1
 except KeyboardInterrupt:
     print ("Exiting")
 finally:
