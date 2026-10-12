@@ -10,7 +10,6 @@ import numpy as np
 from numba import njit
 import cv2
 import heapq
-import math
 
 ipAddress = "ws://localhost:9000"
 wsConnected = False
@@ -31,20 +30,21 @@ clearance = botRadius + 5
 planningClearance = botRadius + 20
 ticksPerRev = 100
 distancePerTick = np.pi * wheeldiameter / ticksPerRev
-maxVelChange = 2.0
-maxWheelVel = 20.0
+maxVelChange = 8.0
+maxWheelVel = 30
 testWheelVel = 80.0
 speedPrevLeft = 0
 speedPrevRight = 0
 speedPrevTime = 0.0
 
-mapSize = 2440
+mapSize = 5000
 worldMap = np.zeros((mapSize, mapSize), dtype=np.uint8)
 frontierMask = np.zeros((mapSize, mapSize), dtype=np.uint8)
 frontierTarget = None
 updateCounter = 0
 explorationComplete = False
 noFrontier = 0
+mapSaved = False
 
 planningEvent = threading.Event()
 pathLock = threading.Lock()
@@ -62,7 +62,7 @@ waypointTolerance = 8.0
 lookAhead = 30
 linearGain = 0.8
 angularGain = 3.0
-
+now = time.time()
 testMode = False
 
 photo = cv2.imread("bot.png", cv2.IMREAD_UNCHANGED)
@@ -97,12 +97,11 @@ def onMessage(ws, message):
 
     data = json.loads(message)
 
-    now = time.time()
 
     if data.get("type") == "DEBUG":
         if not startrecieved:
-            robotX = data["x"]
-            robotY = data["y"]
+            robotX = mapSize / 2 #data["x"]
+            robotY = mapSize / 2 #data["y"] 
             theta = data["theta"]
             startAngle = np.deg2rad(theta)
             robotAngle = startAngle
@@ -197,7 +196,11 @@ def plannerLoop():
                     waypointIndex = 0
                 duration = time.time() - now
                 print("map fully explored, it took : ", round(duration,2), " seconds" )
-
+                if not mapSaved:
+                    np.save("binary_map.npy", worldMap)
+                    print("Map saved")
+                    cv2.imwrite("binary_map.png", worldMap * 255)
+                    mapSaved = True
             continue
 
         noFrontier = 0
@@ -349,10 +352,17 @@ def displayMap():
     display[worldMap == 2] = (0, 0, 255)
     display[frontierMask == 1] = (255, 0, 0)
 
-    if currentPath is not None and len(currentPath) > 0:
-        for i in range(len(currentPath) - 1):
-            x1, y1 = currentPath[i]
-            x2, y2 = currentPath[i + 1]
+    # Take a safe snapshot of the current path
+    with pathLock:
+        pathToDisplay = currentPath.copy()
+
+    if pathToDisplay is not None and len(pathToDisplay) > 0:
+
+        for i in range(len(pathToDisplay) - 1):
+
+            x1, y1 = pathToDisplay[i]
+            x2, y2 = pathToDisplay[i + 1]
+
             cv2.line(
                 display,
                 (int(x1), int(y1)),
@@ -376,7 +386,7 @@ def displayMap():
             cv2.copyTo(bot[:, :, :3], mask, display[y:y + 100, x:x + 100])
         else:
             cv2.copyTo(bot, circleMask, display[y:y + 100, x:x + 100])
-    #cv2.circle(display, (int(robotX), int(robotY)), 50, (0,255,0), -1)
+    cv2.circle(display, (int(robotX), int(robotY)), 50, (0,255,0), -1)
 
     arrowLength = 100
     startPoint = (int(robotX), int(robotY))
@@ -830,7 +840,23 @@ def followPath():
         # Near obstacles: turn safely on the spot if needed
         turnThreshold = np.deg2rad(15)
         if headingAbs > turnThreshold:
-            turnSpeed = 20.0
+            headingErrorDeg = abs(np.rad2deg(headingError))
+
+            # Choose turning speed based on how far away the heading is
+            if headingErrorDeg > 60:
+                turnSpeed = 35.0
+
+            elif headingErrorDeg > 35:
+                turnSpeed = 25.0
+
+            elif headingErrorDeg > 20:
+                turnSpeed = 15.0
+
+            elif headingErrorDeg > 10:
+                turnSpeed = 8.0
+
+            else:
+                turnSpeed = 4.0
             if headingError > 0:
                 leftWheel = -turnSpeed
                 rightWheel = turnSpeed
