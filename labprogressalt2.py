@@ -236,6 +236,8 @@ def mappingLoop():
             planningEvent.set()
 
 
+
+
 def saveMap(force=False):
     """Save the occupancy map once exploration is genuinely complete."""
     global mapSaved
@@ -531,13 +533,7 @@ def plannerLoop():
 
             for frontierPoint, approachGoal in candidates[:maxFrontierCandidates]:
                 astarStart = time.perf_counter()
-
-                candidatePath = localAStar(
-                    planningMap,
-                    planningStart,
-                    approachGoal
-                )
-
+                candidatePath = localAStar(planningMap, planningStart,approachGoal)
                 astarTotal += time.perf_counter() - astarStart
 
                 if len(candidatePath) > 0:
@@ -546,12 +542,7 @@ def plannerLoop():
                     chosenFrontier = frontierPoint
                     break
 
-                print(
-                    "A* could not reach approach goal",
-                    approachGoal,
-                    "for frontier",
-                    frontierPoint
-                )
+                print("A* could not reach approach goal", approachGoal, "for frontier", frontierPoint)
                 failedFrontiers.append(frontierPoint)
 
         candidateEnd = time.perf_counter()
@@ -560,14 +551,8 @@ def plannerLoop():
             if len(candidates) == 0:
                 print("Frontiers exist, but no safe approach goals are currently available")
             else:
-                print(
-                    "No reachable safe approach goal among",
-                    min(len(candidates), maxFrontierCandidates),
-                    "candidates"
-                )
-
+                print("No reachable safe approach goal among",min(len(candidates), maxFrontierCandidates),"candidates")
             noFrontier += 1
-
             if failedFrontiers and noFrontier >= 2:
                 print("Clearing temporary failed-frontier list")
                 failedFrontiers.clear()

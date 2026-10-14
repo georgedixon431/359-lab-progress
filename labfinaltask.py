@@ -72,6 +72,7 @@ mapSize = 6000
 
 # Start every run with a fresh, empty occupancy map.
 worldMap = np.zeros((mapSize, mapSize), dtype=np.uint8)
+mapEvidence = np.zeros((mapSize, mapSize), dtype=np.int8)
 
 frontierMask = np.zeros((mapSize, mapSize), dtype=np.uint8)
 frontierTarget = None
@@ -132,7 +133,7 @@ photoPath = os.path.join(scriptFolder, "bot.png")
 photo = cv2.imread(photoPath, cv2.IMREAD_UNCHANGED) if os.path.exists(photoPath) else None
 
 #partcle filter variables
-Particles = 5000
+Particles = 10000
 twoPi = 2.0 * np.pi
 particleNoise = 20
 angleNoise = np.pi / 8
@@ -144,35 +145,41 @@ def checkLidarMatch(robotX, robotY, robotAngle, actualScan):
     predictedPose = np.array([[robotX, robotY, robotAngle]])
 
     predictedScan = simulateScans(
-        worldMap, predictedPose, lidar_points,Maximum_scan_range, resolution_of_range_sensor)[0]
+        worldMap, mapEvidence, predictedPose,
+        lidar_points, Maximum_scan_range,
+        resolution_of_range_sensor
+    )[0]
 
-    actualScan = np.asarray(actualScan)
+    actualScan = np.asarray(actualScan, dtype=np.float64)
 
-    valid = (
-        np.isfinite(predictedScan)
-        & (actualScan > 0)
-        & (actualScan < Maximum_scan_range)
-    )
+    valid = (np.isfinite(predictedScan) & (actualScan > 0) & (actualScan < Maximum_scan_range))
+    validCount = np.sum(valid)
 
-    if np.sum(valid) < 10:
-        return True, 0.0
+    if validCount < 10:
+        return "UNKNOWN", float("inf")
 
     difference = np.abs(predictedScan[valid] - actualScan[valid])
     meanDifference = np.mean(difference)
 
-    return meanDifference < 10.0, meanDifference
+    if meanDifference < 10.0:
+        return "MATCH", meanDifference
 
-def populateParticles(numParticles, robotX, robotY, robotAngle):
+    return "MISMATCH", meanDifference
+
+def populateParticles(numParticles, robotX, robotY, robotAngle, deltaLeft, deltaRight):
+    global wheelbase
+    positionNoise = max(3.0, (abs(deltaLeft) + abs(deltaRight)) / 2)
+    headingNoise = max(np.deg2rad(2),(abs(deltaLeft) + abs(deltaRight)) / wheelbase)
     particles = np.zeros((numParticles, 3), dtype=np.float64)
     for i in range(numParticles):
-        x = robotX + np.random.uniform(-particleNoise, particleNoise)
-        y = robotY + np.random.uniform(-particleNoise, particleNoise)
-        angle = robotAngle + np.random.uniform(-angleNoise, angleNoise)
+        x = robotX + np.random.uniform(-positionNoise, positionNoise)
+        y = robotY + np.random.uniform(-positionNoise, positionNoise)
+        angle = robotAngle + np.random.uniform(-headingNoise, headingNoise)
         particles[i] = [x, y, angle]
     return particles
 
 @njit(parallel=True, cache=True)
-def simulateScans(worldMap, particles, lidarCount, maxRange, rangeResolution):
+def simulateScans(worldMap, mapEvidence, particles, lidarCount, maxRange, rangeResolution):
     n = particles.shape[0]
     mapSize = worldMap.shape[0]
 
@@ -204,8 +211,9 @@ def simulateScans(worldMap, particles, lidarCount, maxRange, rangeResolution):
 
                 cell = worldMap[row, col]
 
-                if cell == 2:  # Occupied
-                    scans[i, k] = min(dist, maxRange)
+                if cell == 2:
+                    if mapEvidence[row, col] >= 5:
+                        scans[i, k] = min(dist, maxRange)
                     break
 
                 if cell == 0:  # Unknown
@@ -217,18 +225,19 @@ def simulateScans(worldMap, particles, lidarCount, maxRange, rangeResolution):
 def computeWeights(simulatedScans, actualScan):
     actualScan = np.asarray(actualScan, dtype=np.float64)
 
-    valid = (
-        np.isfinite(simulatedScans)
-        & (actualScan[None, :] > 0)
-        & (actualScan[None, :] < 500)
-    )
+    # Simulated ray must hit a mapped obstacle
+    valid = np.isfinite(simulatedScans)
 
-    difference = simulatedScans - actualScan[None, :]
+    # Compare actual readings including 500
+    actual = np.minimum(actualScan[None, :], 500.0)
+
+    difference = simulatedScans - actual
+
     squaredError = np.where(valid, difference**2, 0.0)
 
     validCount = np.sum(valid, axis=1)
 
-    meanError = np.sum(squaredError, axis=1) / np.maximum(validCount, 1)
+    meanError = (np.sum(squaredError, axis=1)/ np.maximum(validCount, 1))
 
     sigma = 10.0
     weights = np.exp(-meanError / (2 * sigma**2))
@@ -240,13 +249,13 @@ def computeWeights(simulatedScans, actualScan):
 
     return weights / np.sum(weights)
 
-def chooseParticle(robotX, robotY, robotAngle, actualScan, weight):
-    particles = populateParticles(Particles, robotX, robotY, robotAngle)
-    scans = simulateScans(worldMap, particles, lidar_points, Maximum_scan_range, resolution_of_range_sensor)
+def chooseParticle(robotX, robotY, robotAngle, actualScan, deltaLeft, deltaRight):
+    particles = populateParticles(Particles, robotX, robotY, robotAngle, deltaLeft, deltaRight)
+    scans = simulateScans(worldMap, mapEvidence, particles, lidar_points, Maximum_scan_range, resolution_of_range_sensor)
     weights = computeWeights(scans, actualScan)
 
     if weights is None:
-        return robotX, robotY, robotAngle
+        return robotX, robotY, robotAngle, 0.0
 
     bestIndex = np.argmax(weights)
 
@@ -255,7 +264,7 @@ def chooseParticle(robotX, robotY, robotAngle, actualScan, weight):
     robotY = particles[bestIndex, 1]
     robotAngle = particles[bestIndex, 2]
 
-    return robotX, robotY, robotAngle
+    return robotX, robotY, robotAngle, weight
     
 
 
@@ -267,13 +276,8 @@ def limitVelocity(current, target):
     else:
         maxVel = maxWheelVel
     target = np.clip(target, -maxVel, maxVel)
-
     difference = target - current
-    difference = np.clip(
-        difference,
-        -maxVelChange,
-        maxVelChange
-    )
+    difference = np.clip(difference, -maxVelChange, maxVelChange)
 
     return current + difference
 
@@ -322,6 +326,35 @@ def onMessage(ws, message):
         except queue.Full:
             pass
 
+def makeRegularisedMap(worldMap):
+    occupied = (worldMap == 2).astype(np.uint8) * 255
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    closed = cv2.morphologyEx(occupied, cv2.MORPH_CLOSE, kernel, iterations=1)
+    contours, hierarchy = cv2.findContours(closed, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    cleanMask = closed.copy()
+
+    for cnt in contours:
+        perimeter = cv2.arcLength(cnt, True)
+
+        if perimeter < 40:
+            continue
+
+        # Preserve more detail around corners
+        epsilon = 0.005 * perimeter
+        approx = cv2.approxPolyDP(cnt,epsilon,True)
+
+        # Draw only when the fitted geometry is close to
+        # existing observed obstacle pixels.
+        cv2.polylines(cleanMask,[approx],True,255,1)
+
+    regularisedMap = worldMap.copy()
+    # Preserve the original map and add cleaned boundaries
+    regularisedMap[cleanMask > 0] = 2
+
+    return regularisedMap
+
 
 def mappingLoop():
     """Process odometry and occupancy-grid updates away from onMessage()."""
@@ -336,17 +369,21 @@ def mappingLoop():
         sensorArray = np.asarray(scan, dtype=np.float64)
 
         with mapLock:
-            updatePosition(left, right, yaw)
+            deltaLeft, deltaRight = updatePosition(left, right, yaw)
             predictedX = robotX
             predictedY = robotY
-            lidarMatch, lidarDifference = checkLidarMatch(robotX, robotY, robotAngle, sensorArray)
-            if not lidarMatch:
-                robotX, robotY, robotAngle = chooseParticle(robotX, robotY, robotAngle, sensorArray, weight)
-            slipDifference = np.hypot(robotX - predictedX, robotY - predictedY)
+            lidarStatus, lidarDifference = checkLidarMatch(robotX, robotY, robotAngle, sensorArray)
+            if lidarStatus == "MISMATCH":
+                robotX, robotY, robotAngle, weight = chooseParticle(
+                    robotX, robotY, robotAngle,
+                    sensorArray, deltaLeft, deltaRight
+                )
+            slipDifference = np.sqrt((predictedX - robotX)**2 + (predictedY - robotY)**2)
             if slipDifference > 0.0:
-                print(f"Slip detected: {slipDifference:.2f} pixels. Adjusting position to ({robotX:.2f}, {robotY:.2f}). position weight - {weight:.4f}")
+                print(f"Slip detected: {slipDifference:.2f} pixels. Adjusting position to ({robotX:.2f}, {robotY:.2f}). position weight - {weight:.4f} lidar difference - {lidarDifference:.4f}")
             updateMapNumba(
                 worldMap,
+                mapEvidence,
                 sensorArray,
                 robotX,
                 robotY,
@@ -357,7 +394,8 @@ def mappingLoop():
             updateCounter += 1
 
             if updateCounter % 10 == 0:
-                frontierMask = findFrontiersNumba(worldMap)
+                regularisedMap = makeRegularisedMap(worldMap)
+                frontierMask = findFrontiersNumba(regularisedMap)
 
         # Replan periodically on a separate planner thread.
         if updateCounter % 50 == 0 and not explorationComplete:
@@ -371,8 +409,9 @@ def saveMap(force=False):
     if mapSaved and not force:
         return
 
-    npyPath = os.path.join(scriptFolder, "binary_map.npy")
-    pngPath = os.path.join(scriptFolder, "binary_map.png")
+    randomSuffix = np.random.randint(1000, 9999)
+    npyPath = os.path.join(scriptFolder, f"binary_map_{randomSuffix}.npy")
+    pngPath = os.path.join(scriptFolder, f"binary_map_{randomSuffix}.png")
 
     np.save(npyPath, worldMap)
 
@@ -445,13 +484,14 @@ def plannerLoop():
             continue
 
         replanStart = time.perf_counter()
-        print("Replanning...")
+        #print("Replanning...")
 
         # Take a snapshot quickly, then release the map lock before the expensive
         # OpenCV/A* work. Mapping and WebSocket reception can continue meanwhile.
         copyStart = time.perf_counter()
         with mapLock:
             mapCopy = worldMap.copy()
+            regCopy = makeRegularisedMap(mapCopy)
             frontierCopy = frontierMask.copy()
             startX = int(round(robotX))
             startY = int(round(robotY))
@@ -480,17 +520,14 @@ def plannerLoop():
         noFrontier = 0
 
         planningMapStart = time.perf_counter()
-        planningMap = createPlanningMap(mapCopy)
+        regCopy = makeRegularisedMap(mapCopy)
+        distances = createDistanceMap(regCopy)
+        planningMap = createInflatedMap(regCopy, distances, planningClearance)
         planningMapEnd = time.perf_counter()
 
         # Obstacle inflation/noise can occasionally put the robot's exact map
         # cell inside a blocked planning cell. Snap to nearby known free space.
-        planningStart = findNearestPlanningFree(
-            planningMap,
-            startX,
-            startY,
-            maxRadius=planningClearance + 40
-        )
+        planningStart = findNearestPlanningFree(planningMap,startX,startY,maxRadius=planningClearance + 40)
 
         if planningStart is None:
             print("Could not find traversable planning cell near robot")
@@ -540,9 +577,9 @@ def plannerLoop():
                     chosenPath = persistentPath
                     chosenGoal = persistentGoal
                     chosenFrontier = persistentFrontier
-                    print("Keeping current frontier:", persistentFrontier)
+                    #print("Keeping current frontier:", persistentFrontier)
                 else:
-                    print("Current frontier became unreachable:", persistentFrontier)
+                    #print("Current frontier became unreachable:", persistentFrontier)
                     failedFrontiers.append(persistentFrontier)
 
         # Only choose a new objective when the old one disappeared or became
@@ -558,13 +595,7 @@ def plannerLoop():
 
             for frontierPoint, approachGoal in candidates[:maxFrontierCandidates]:
                 astarStart = time.perf_counter()
-
-                candidatePath = localAStar(
-                    planningMap,
-                    planningStart,
-                    approachGoal
-                )
-
+                candidatePath = localAStar(planningMap, planningStart, approachGoal)
                 astarTotal += time.perf_counter() - astarStart
 
                 if len(candidatePath) > 0:
@@ -573,7 +604,7 @@ def plannerLoop():
                     chosenFrontier = frontierPoint
                     break
 
-                print("A* could not reach approach goal",approachGoal,"for frontier",frontierPoint)
+                #print("A* could not reach approach goal",approachGoal,"for frontier",frontierPoint)
                 failedFrontiers.append(frontierPoint)
 
         candidateEnd = time.perf_counter()
@@ -601,7 +632,7 @@ def plannerLoop():
 
         # Use a slightly more conservative map only when removing waypoints.
         # This prevents the simplified straight segments from cutting corners.
-        safetyMap = createSafetyMap(mapCopy)
+        safetyMap = createInflatedMap(regCopy, distances, safetyClearance)
         newPath = simplifyPath(chosenPath, safetyMap)
 
         # Only replace the old path after a valid replacement is completely ready.
@@ -612,21 +643,8 @@ def plannerLoop():
             currentFrontier = chosenFrontier
 
         totalEnd = time.perf_counter()
-        print(
-            "New path:",
-            len(newPath),
-            "points -> approach",
-            chosenGoal,
-            "for frontier",
-            chosenFrontier
-        )
-        print(
-            "Planning times | copy:", round(copyEnd - copyStart, 3),
-            "planning map:", round(planningMapEnd - planningMapStart, 3),
-            "frontiers:", round(candidateEnd - candidateStart, 3),
-            "A* total:", round(astarTotal, 3),
-            "total:", round(totalEnd - replanStart, 3), "seconds"
-        )
+        #print("New path:",len(newPath),"points -> approach",chosenGoal,"for frontier",chosenFrontier)
+        #print("Planning times | copy:", round(copyEnd - copyStart, 3),"planning map:", round(planningMapEnd - planningMapStart, 3),"frontiers:", round(candidateEnd - candidateStart, 3),"A* total:", round(astarTotal, 3),"total:", round(totalEnd - replanStart, 3), "seconds")
 
 def onClose (ws, code, reason):
     global wsConnected
@@ -647,34 +665,71 @@ def runWS ():
     ws.run_forever ()
 
 @njit(nogil=True, cache=True)
-def updateMapNumba(worldMap, sensorData, robotX, robotY, robotAngle, mapSize):
+def updateMapNumba(worldMap, mapEvidence, sensorData,
+                   robotX, robotY, robotAngle, mapSize):
 
     n = len(sensorData)
 
     for i in range(n):
         distance = sensorData[i]
 
-        angle = robotAngle + i * (2.0 * np.pi / n)
+        if distance <= 0 or not np.isfinite(distance):
+            continue
 
+        distance = min(distance, 500.0)
+
+        angle = robotAngle + i * (2.0 * np.pi / n)
         cosA = np.cos(angle)
         sinA = np.sin(angle)
 
-        # Mark free space along lidar ray
-        for d in range(int(distance)):
+        freeDistance = max(0.0, distance - 4.0)
+
+        blocked = False
+
+        # Mark free space along the ray
+        for d in range(int(freeDistance)):
+
             x = int(robotX + d * cosA)
             y = int(robotY - d * sinA)
 
-            if 0 <= x < mapSize and 0 <= y < mapSize:
-                if worldMap[y, x] != 2:
-                    worldMap[y, x] = 1
+            if not (0 <= x < mapSize and 0 <= y < mapSize):
+                blocked = True
+                break
 
-        # Mark obstacle
-        if distance < 500:
+            # Don't clear or pass through strongly confirmed walls
+            if mapEvidence[y, x] >= 8:
+                blocked = True
+                break
+
+            mapEvidence[y, x] = max(
+                -12, int(mapEvidence[y, x]) - 1
+            )
+
+            if mapEvidence[y, x] >= 5:
+                worldMap[y, x] = 2
+            elif mapEvidence[y, x] <= -2:
+                worldMap[y, x] = 1
+            else:
+                worldMap[y, x] = 0
+
+        # Only add an obstacle endpoint if the ray was not blocked
+        if not blocked and distance < 500:
+
             endX = int(robotX + distance * cosA)
             endY = int(robotY - distance * sinA)
 
             if 0 <= endX < mapSize and 0 <= endY < mapSize:
-                worldMap[endY, endX] = 2
+
+                mapEvidence[endY, endX] = min(
+                    12, int(mapEvidence[endY, endX]) + 3
+                )
+
+                if mapEvidence[endY, endX] >= 5:
+                    worldMap[endY, endX] = 2
+                elif mapEvidence[endY, endX] <= -2:
+                    worldMap[endY, endX] = 1
+                else:
+                    worldMap[endY, endX] = 0
 
 
 def updatePosition(leftEncoder, rightEncoder, yawDelta):
@@ -699,51 +754,47 @@ def updatePosition(leftEncoder, rightEncoder, yawDelta):
     robotX = np.clip(robotX, botRadius, mapSize - botRadius - 1)
     robotY = np.clip(robotY, botRadius, mapSize - botRadius - 1)
 
+    return deltaLeft, deltaRight
 
-def createPlanningMap(mapData):
 
-    # Actual known obstacles
-    obstacleMask = (mapData == 2).astype(np.uint8)
+def createDistanceMap(mapData):
+    freeMask = (mapData != 2).astype(np.uint8)
 
-    kernelSize = 2 * planningClearance + 1
+    return cv2.distanceTransform(
+        freeMask,
+        cv2.DIST_L2,
+        cv2.DIST_MASK_PRECISE
+    )
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernelSize, kernelSize))
 
-    inflatedObstacles = cv2.dilate(obstacleMask, kernel)
+def createInflatedMap(mapData, distances, clearance):
+    result = (
+        (distances <= clearance) | (mapData == 0)
+    ).astype(np.uint8)
 
-    # Unknown space must also be blocked
-    planningMap = np.zeros_like(mapData, dtype=np.uint8)
+    result[:clearance, :] = 1
+    result[-clearance:, :] = 1
+    result[:, :clearance] = 1
+    result[:, -clearance:] = 1
 
-    planningMap[mapData == 0] = 1
-    planningMap[inflatedObstacles == 1] = 1
-
-    planningMap[:planningClearance, :] = 1
-    planningMap[-planningClearance:, :] = 1
-    planningMap[:, :planningClearance] = 1
-    planningMap[:, -planningClearance:] = 1
-
-    return planningMap
+    return result
 
 
 def createSafetyMap(mapData):
-    """Slightly more conservative map used only for path simplification.
-
-    A* still plans with planningClearance so narrow valid routes are not thrown
-    away, but shortcutting/simplification must obey the larger safety margin.
-    """
     obstacleMask = (mapData == 2).astype(np.uint8)
 
-    kernelSize = 2 * safetyClearance + 1
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (kernelSize, kernelSize)
+    freeMask = 1 - obstacleMask
+
+    distances = cv2.distanceTransform(
+        freeMask,
+        cv2.DIST_L2,
+        cv2.DIST_MASK_PRECISE
     )
 
-    inflatedObstacles = cv2.dilate(obstacleMask, kernel)
-
     safetyMap = np.zeros_like(mapData, dtype=np.uint8)
+
+    safetyMap[distances <= safetyClearance] = 1
     safetyMap[mapData == 0] = 1
-    safetyMap[inflatedObstacles == 1] = 1
 
     safetyMap[:safetyClearance, :] = 1
     safetyMap[-safetyClearance:, :] = 1
@@ -1637,8 +1688,6 @@ try:
                     wsInstance.send(f"MOVE {currentLeftVel} {currentRightVel}")
                 except Exception as e:
                     print ("Sending failed", e)
-
-
 
         if currentTime - lastDisplay >= 0.1:
             displayMap()
