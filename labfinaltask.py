@@ -133,16 +133,23 @@ photoPath = os.path.join(scriptFolder, "bot.png")
 photo = cv2.imread(photoPath, cv2.IMREAD_UNCHANGED) if os.path.exists(photoPath) else None
 
 #partcle filter variables
-Particles = 10000
+Particles = 15000
 twoPi = 2.0 * np.pi
 particleNoise = 20
 angleNoise = np.pi / 8
 sigma = 10.0
 slipDifference = 0.0
 weight = 0.0
+slipfound = False
+lidarmatches = 0
+notlidarmatch = 0
 
 def checkLidarMatch(robotX, robotY, robotAngle, actualScan):
+    global lidarmatches, notlidarmatch
     predictedPose = np.array([[robotX, robotY, robotAngle]])
+
+    lidarmatches = 0
+    notlidarmatch = 0
 
     predictedScan = simulateScans(
         worldMap, mapEvidence, predictedPose,
@@ -152,19 +159,36 @@ def checkLidarMatch(robotX, robotY, robotAngle, actualScan):
 
     actualScan = np.asarray(actualScan, dtype=np.float64)
 
-    valid = (np.isfinite(predictedScan) & (actualScan > 0) & (actualScan < Maximum_scan_range))
-    validCount = np.sum(valid)
-
-    if validCount < 10:
+    for s in range(len(predictedScan)):
+        predicted = predictedScan[s]
+        actual = actualScan[s]
+        if (Maximum_scan_range> predicted > 0) and (np.isfinite(predicted)):
+            lidarmatches +=1
+            if (predicted != actual):
+                notlidarmatch += 1
+                
+    if lidarmatches < 10:
         return "UNKNOWN", float("inf")
 
-    difference = np.abs(predictedScan[valid] - actualScan[valid])
-    meanDifference = np.mean(difference)
+    if notlidarmatch > 1:
+         return "MISMATCH", notlidarmatch
 
-    if meanDifference < 10.0:
-        return "MATCH", meanDifference
+    return "MATCH", notlidarmatch
 
-    return "MISMATCH", meanDifference
+
+    # valid = (np.isfinite(predictedScan) & (actualScan > 0) & (actualScan < Maximum_scan_range))
+    # validCount = np.sum(valid)
+
+    # if validCount < 10:
+    #     return "UNKNOWN", float("inf")
+
+    # difference = np.abs(predictedScan[valid] - actualScan[valid])
+    # meanDifference = np.mean(difference)
+
+    # if meanDifference < 10.0:
+    #     return "MATCH", meanDifference
+
+    # return "MISMATCH", meanDifference
 
 def populateParticles(numParticles, robotX, robotY, robotAngle, deltaLeft, deltaRight):
     global wheelbase
@@ -358,7 +382,7 @@ def makeRegularisedMap(worldMap):
 
 def mappingLoop():
     """Process odometry and occupancy-grid updates away from onMessage()."""
-    global updateCounter, frontierMask, robotX, robotY, robotAngle, weight, slipDifference
+    global updateCounter, frontierMask, robotX, robotY, robotAngle, weight, slipDifference, slipfound
 
     while True:
         scan, left, right, yaw = dataQueue.get()
@@ -380,16 +404,21 @@ def mappingLoop():
                 )
             slipDifference = np.sqrt((predictedX - robotX)**2 + (predictedY - robotY)**2)
             if slipDifference > 0.0:
-                print(f"Slip detected: {slipDifference:.2f} pixels. Adjusting position to ({robotX:.2f}, {robotY:.2f}). position weight - {weight:.4f} lidar difference - {lidarDifference:.4f}")
-            updateMapNumba(
-                worldMap,
-                mapEvidence,
-                sensorArray,
-                robotX,
-                robotY,
-                robotAngle,
-                mapSize
-            )
+                print(f"Slip detected: {slipDifference:.2f} pixels. Adjusting position from ({predictedX:.2f}, {predictedY:.2f}) to ({robotX:.2f}, {robotY:.2f}). position weight - {weight:.4f} lidar difference - {lidarDifference:.4f}")
+                if not slipfound:
+                    slipfound = True
+            if slipfound:
+                updateMapNumba(
+                    worldMap,
+                    mapEvidence,
+                    sensorArray,
+                    robotX,
+                    robotY,
+                    robotAngle,
+                    mapSize
+                )
+            elif not slipfound:
+                firstupdateMapNumba(worldMap, mapEvidence, sensorData, robotX, robotY, robotAngle, mapSize)
 
             updateCounter += 1
 
@@ -673,14 +702,14 @@ def updateMapNumba(worldMap, mapEvidence, sensorData,
     for i in range(n):
         distance = sensorData[i]
 
+        angle = robotAngle + i * (2.0 * np.pi / n)
+        cosA = np.cos(angle)
+        sinA = np.sin(angle)
+
         if distance <= 0 or not np.isfinite(distance):
             continue
 
         distance = min(distance, 500.0)
-
-        angle = robotAngle + i * (2.0 * np.pi / n)
-        cosA = np.cos(angle)
-        sinA = np.sin(angle)
 
         freeDistance = max(0.0, distance - 4.0)
 
@@ -730,6 +759,37 @@ def updateMapNumba(worldMap, mapEvidence, sensorData,
                     worldMap[endY, endX] = 1
                 else:
                     worldMap[endY, endX] = 0
+
+@njit(nogil=True, cache=True)
+def firstupdateMapNumba(worldMap, mapEvidence, sensorData, robotX, robotY, robotAngle, mapSize):
+
+    n = len(sensorData)
+
+    for i in range(n):
+        distance = sensorData[i]
+
+        angle = robotAngle + i * (2.0 * np.pi / n)
+
+        cosA = np.cos(angle)
+        sinA = np.sin(angle)
+
+        # Mark free space along lidar ray
+        for d in range(int(distance)):
+            x = int(robotX + d * cosA)
+            y = int(robotY - d * sinA)
+
+            if 0 <= x < mapSize and 0 <= y < mapSize:
+                if worldMap[y, x] != 2:
+                    worldMap[y, x] = 1
+
+        # Mark obstacle
+        if distance < 500:
+            endX = int(robotX + distance * cosA)
+            endY = int(robotY - distance * sinA)
+
+            if 0 <= endX < mapSize and 0 <= endY < mapSize:
+                worldMap[endY, endX] = 2
+                mapEvidence[endY, endX] = 10
 
 
 def updatePosition(leftEncoder, rightEncoder, yawDelta):
