@@ -62,7 +62,7 @@ narrowClearanceMode = False
 ticksPerRev = 100
 distancePerTick = np.pi * wheeldiameter / ticksPerRev
 maxVelChange = 8.0
-maxWheelVel = 30
+maxWheelVel = 20
 testWheelVel = 80.0
 speedPrevLeft = 0
 speedPrevRight = 0
@@ -73,6 +73,10 @@ mapSize = 6000
 # Start every run with a fresh, empty occupancy map.
 worldMap = np.zeros((mapSize, mapSize), dtype=np.uint8)
 mapEvidence = np.zeros((mapSize, mapSize), dtype=np.int8)
+wallContradictions = np.zeros(
+    (mapSize, mapSize),
+    dtype=np.uint8
+)
 
 frontierMask = np.zeros((mapSize, mapSize), dtype=np.uint8)
 frontierTarget = None
@@ -83,6 +87,13 @@ mapSaved = False
 failedFrontiers = []
 failedFrontierRadius = 15
 sqrt2 = np.sqrt(2.0)
+
+# Semi-manual controls
+manualFrontierRequest = None   # map (x, y) selected by mouse
+manualMode = False             # press M, then click desired frontier
+mouseMapPosition = None        # cursor position shown in map coordinates
+manualTargetLock = threading.Lock()
+manualSearchRadius = 180       # map pixels around click to snap to a real frontier
 
 # Frontiers already successfully approached.
 # Keep this radius deliberately small so nearby corners/branches can still be
@@ -133,7 +144,7 @@ photoPath = os.path.join(scriptFolder, "bot.png")
 photo = cv2.imread(photoPath, cv2.IMREAD_UNCHANGED) if os.path.exists(photoPath) else None
 
 #partcle filter variables
-Particles = 10000
+Particles = 15000
 twoPi = 2.0 * np.pi
 particleNoise = 20
 angleNoise = np.pi / 8
@@ -326,32 +337,87 @@ def onMessage(ws, message):
         except queue.Full:
             pass
 
-def makeRegularisedMap(worldMap):
-    occupied = (worldMap == 2).astype(np.uint8) * 255
+def makeRegularisedMap(worldMap, robotX, robotY, padding=120):
+    h, w = worldMap.shape
+
+    knownYs, knownXs = np.where(worldMap != 0)
+
+    if len(knownXs) == 0:
+        return worldMap.copy()
+
+    minX = max(0, int(np.min(knownXs)) - padding)
+    maxX = min(w, int(np.max(knownXs)) + padding + 1)
+    minY = max(0, int(np.min(knownYs)) - padding)
+    maxY = min(h, int(np.max(knownYs)) + padding + 1)
+
+    crop = worldMap[minY:maxY, minX:maxX].copy()
+
+    # Robot position in crop coordinates
+    rx = int(round(robotX)) - minX
+    ry = int(round(robotY)) - minY
+
+    if not (0 <= rx < crop.shape[1] and 0 <= ry < crop.shape[0]):
+        return worldMap.copy()
+
+    # -------------------------------------------------
+    # 2. Regularise obstacle walls
+    # -------------------------------------------------
+    occupied = cv2.inRange(crop, 2, 2)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    closed = cv2.morphologyEx(occupied, cv2.MORPH_CLOSE, kernel, iterations=1)
-    contours, hierarchy = cv2.findContours(closed, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    occupied = cv2.morphologyEx(occupied, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-    cleanMask = closed.copy()
+    contours, _ = cv2.findContours(
+        occupied, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+    )
 
     for cnt in contours:
         perimeter = cv2.arcLength(cnt, True)
-
         if perimeter < 40:
             continue
 
-        # Preserve more detail around corners
         epsilon = 0.005 * perimeter
-        approx = cv2.approxPolyDP(cnt,epsilon,True)
+        approx = cv2.approxPolyDP(cnt, epsilon, True)
+        cv2.polylines(occupied, [approx], True, 255, 1)
 
-        # Draw only when the fitted geometry is close to
-        # existing observed obstacle pixels.
-        cv2.polylines(cleanMask,[approx],True,255,1)
+    regCrop = crop.copy()
+    regCrop[occupied > 0] = 2
 
+    # -------------------------------------------------
+    # 3. Remove stray free-space blobs behind walls
+    # -------------------------------------------------
+    freeMask = cv2.inRange(regCrop, 1, 1)
+
+    # obstacle pixels are barriers
+    freeMask[occupied > 0] = 0
+
+    numLabels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        freeMask, connectivity=8
+    )
+
+    # Find the robot's free-space component
+    robotLabel = 0
+    if 0 <= ry < labels.shape[0] and 0 <= rx < labels.shape[1]:
+        robotLabel = labels[ry, rx]
+
+    cleanedCrop = regCrop.copy()
+
+    # If robot is standing on a valid free component, keep only that component
+    if robotLabel != 0:
+        strayMask = (regCrop == 1) & (labels != robotLabel)
+        cleanedCrop[strayMask] = 0
+    else:
+        # fallback: remove only tiny isolated free blobs
+        for label in range(1, numLabels):
+            area = stats[label, cv2.CC_STAT_AREA]
+            if area < 25:
+                cleanedCrop[labels == label] = 0
+
+    # -------------------------------------------------
+    # 4. Put cleaned crop back into full map
+    # -------------------------------------------------
     regularisedMap = worldMap.copy()
-    # Preserve the original map and add cleaned boundaries
-    regularisedMap[cleanMask > 0] = 2
+    regularisedMap[minY:maxY, minX:maxX] = cleanedCrop
 
     return regularisedMap
 
@@ -384,6 +450,7 @@ def mappingLoop():
             updateMapNumba(
                 worldMap,
                 mapEvidence,
+                wallContradictions,
                 sensorArray,
                 robotX,
                 robotY,
@@ -393,8 +460,8 @@ def mappingLoop():
 
             updateCounter += 1
 
-            if updateCounter % 10 == 0:
-                regularisedMap = makeRegularisedMap(worldMap)
+            if updateCounter % 100 == 0:
+                regularisedMap = makeRegularisedMap(worldMap, robotX, robotY)
                 frontierMask = findFrontiersNumba(regularisedMap)
 
         # Replan periodically on a separate planner thread.
@@ -474,7 +541,7 @@ def findNearestPlanningFree(planningMap, x, y, maxRadius=100):
 
 def plannerLoop():
     global currentPath, waypointIndex, frontierTarget, currentFrontier
-    global explorationComplete, noFrontier, failedFrontiers
+    global explorationComplete, noFrontier, failedFrontiers, manualFrontierRequest, manualMode, mouseMapPosition
 
     while True:
         planningEvent.wait()
@@ -491,11 +558,11 @@ def plannerLoop():
         copyStart = time.perf_counter()
         with mapLock:
             mapCopy = worldMap.copy()
-            regCopy = makeRegularisedMap(mapCopy)
             frontierCopy = frontierMask.copy()
             startX = int(round(robotX))
             startY = int(round(robotY))
-        copyEnd = time.perf_counter()
+        regCopy = makeRegularisedMap(mapCopy, startX, startY)
+        del mapCopy
 
         # Only declare completion when the frontier detector itself says there
         # are no meaningful frontier clusters left. A failed/blacklisted target
@@ -519,8 +586,6 @@ def plannerLoop():
 
         noFrontier = 0
 
-        planningMapStart = time.perf_counter()
-        regCopy = makeRegularisedMap(mapCopy)
         distances = createDistanceMap(regCopy)
         planningMap = createInflatedMap(regCopy, distances, planningClearance)
         planningMapEnd = time.perf_counter()
@@ -540,6 +605,63 @@ def plannerLoop():
         chosenGoal = None
         chosenFrontier = None
         astarTotal = 0.0
+
+        # --------------------------------------------------------------
+                # MANUAL FRONTIER OVERRIDE
+                # Press M in the map window, then left-click the frontier you want.
+                # The click is snapped to the nearest active frontier and then the
+                # normal safe-approach + A* pipeline is used.
+                # --------------------------------------------------------------
+        with manualTargetLock:
+            manualRequest = manualFrontierRequest
+            manualFrontierRequest = None
+            
+        if manualRequest is not None:
+                requestedX, requestedY = manualRequest
+                manualFrontier = findNearestFrontierToPoint(frontierCopy, requestedX, requestedY, manualSearchRadius)
+            
+                if manualFrontier is None:
+                    print('No active frontier found near manual click:', manualRequest)
+                else:
+                        manualGoal = findSafeApproachGoal(
+                            planningMap,
+                            manualFrontier[0],
+                            manualFrontier[1],
+                            planningStart[0],
+                            planningStart[1]
+                        )
+        
+                        if manualGoal is None:
+                            print('No safe approach goal for manually selected frontier:', manualFrontier)
+                        else:
+                            astarStart = time.perf_counter()
+                            manualPath = localAStar(
+                                planningMap, planningStart, manualGoal
+                            )
+                            astarTotal += time.perf_counter() - astarStart
+        
+                            if len(manualPath) > 0:
+                                chosenPath = manualPath
+                                chosenGoal = manualGoal
+                                chosenFrontier = manualFrontier
+        
+                                # Manual selection intentionally overrides previous
+                                # visited/failed history for this objective.
+                                currentFrontier = manualFrontier
+                                frontierTarget = manualGoal
+                                frontierProgressKey = None
+                                frontierBestDistance = float('inf')
+                                frontierNoProgressPlans = 0
+        
+                                print(
+                                    'MANUAL frontier accepted:', manualFrontier,
+                                    'approach goal:', manualGoal
+                                )
+                            else:
+                                print(
+                                    'A* could not reach manually selected frontier',
+                                    manualFrontier, 'via', manualGoal
+                                )
 
         # --------------------------------------------------------------
         # TARGET PERSISTENCE:
@@ -646,6 +768,48 @@ def plannerLoop():
         #print("New path:",len(newPath),"points -> approach",chosenGoal,"for frontier",chosenFrontier)
         #print("Planning times | copy:", round(copyEnd - copyStart, 3),"planning map:", round(planningMapEnd - planningMapStart, 3),"frontiers:", round(candidateEnd - candidateStart, 3),"A* total:", round(astarTotal, 3),"total:", round(totalEnd - replanStart, 3), "seconds")
 
+def findNearestFrontierToPoint(frontierCopy, x, y, searchRadius=180):
+    """Return the active frontier cell nearest a manually selected map point."""
+    x = int(round(x))
+    y = int(round(y))
+    height, width = frontierCopy.shape
+
+    minX = max(0, x - searchRadius)
+    maxX = min(width - 1, x + searchRadius)
+    minY = max(0, y - searchRadius)
+    maxY = min(height - 1, y + searchRadius)
+
+    crop = frontierCopy[minY:maxY + 1, minX:maxX + 1]
+    ys, xs = np.where(crop == 1)
+    if len(xs) == 0:
+        return None
+
+    xs = xs + minX
+    ys = ys + minY
+    distances = (xs - x) ** 2 + (ys - y) ** 2
+    i = int(np.argmin(distances))
+    return (int(xs[i]), int(ys[i]))
+
+def onMapMouse(event, x, y, flags, param):
+    """Track cursor coordinates and allow manual frontier selection by click."""
+    global mouseMapPosition, manualFrontierRequest, manualMode
+
+    displaySize = 800
+    scale = displaySize / mapSize
+    mapX = int(round(x / scale))
+    mapY = int(round(y / scale))
+    mapX = int(np.clip(mapX, 0, mapSize - 1))
+    mapY = int(np.clip(mapY, 0, mapSize - 1))
+    mouseMapPosition = (mapX, mapY)
+
+    if event == cv2.EVENT_LBUTTONDOWN and manualMode:
+        with manualTargetLock:
+            manualFrontierRequest = (mapX, mapY)
+        manualMode = False
+        print('Manual frontier click requested near:', (mapX, mapY))
+        planningEvent.set()
+
+
 def onClose (ws, code, reason):
     global wsConnected
     print ("Disconnected from the server", reason)
@@ -665,15 +829,22 @@ def runWS ():
     ws.run_forever ()
 
 @njit(nogil=True, cache=True)
-def updateMapNumba(worldMap, mapEvidence, sensorData,
-                   robotX, robotY, robotAngle, mapSize):
-
+def updateMapNumba(
+    worldMap,
+    mapEvidence,
+    wallContradictions,
+    sensorData,
+    robotX,
+    robotY,
+    robotAngle,
+    mapSize
+):
     n = len(sensorData)
 
     for i in range(n):
         distance = sensorData[i]
 
-        if distance <= 0 or not np.isfinite(distance):
+        if not np.isfinite(distance) or distance <= 0:
             continue
 
         distance = min(distance, 500.0)
@@ -682,12 +853,11 @@ def updateMapNumba(worldMap, mapEvidence, sensorData,
         cosA = np.cos(angle)
         sinA = np.sin(angle)
 
-        freeDistance = max(0.0, distance - 4.0)
+        freeDistance = max(0, int(distance - 4))
 
         blocked = False
 
-        # Mark free space along the ray
-        for d in range(int(freeDistance)):
+        for d in range(freeDistance):
 
             x = int(robotX + d * cosA)
             y = int(robotY - d * sinA)
@@ -696,10 +866,22 @@ def updateMapNumba(worldMap, mapEvidence, sensorData,
                 blocked = True
                 break
 
-            # Don't clear or pass through strongly confirmed walls
+            # Strong wall disagrees with current LiDAR ray
             if mapEvidence[y, x] >= 8:
-                blocked = True
-                break
+
+                wallContradictions[y, x] = min(
+                    255, int(wallContradictions[y, x]) + 1
+                )
+
+                # Require several contradictory observations
+                if wallContradictions[y, x] < 5:
+                    blocked = True
+                    break
+
+                # Wall may have been mapped incorrectly
+                mapEvidence[y, x] = 4
+                worldMap[y, x] = 0
+                wallContradictions[y, x] = 0
 
             mapEvidence[y, x] = max(
                 -12, int(mapEvidence[y, x]) - 1
@@ -712,7 +894,7 @@ def updateMapNumba(worldMap, mapEvidence, sensorData,
             else:
                 worldMap[y, x] = 0
 
-        # Only add an obstacle endpoint if the ray was not blocked
+        # Only insert a measured obstacle if the ray was unobstructed
         if not blocked and distance < 500:
 
             endX = int(robotX + distance * cosA)
@@ -723,6 +905,8 @@ def updateMapNumba(worldMap, mapEvidence, sensorData,
                 mapEvidence[endY, endX] = min(
                     12, int(mapEvidence[endY, endX]) + 3
                 )
+
+                wallContradictions[endY, endX] = 0
 
                 if mapEvidence[endY, endX] >= 5:
                     worldMap[endY, endX] = 2
@@ -827,7 +1011,7 @@ def displayMap():
     """Render a 800x800 preview instead of building a 5000x5000 RGB frame."""
     global currentRightVel, currentLeftVel, testMode, robotAngle
     global narrowClearanceMode, planningClearance, safetyClearance
-    global hardStopDistance, slowDistance, slipDifference
+    global hardStopDistance, slowDistance, slipDifference, manualMode, mouseMapPosition
 
     displaySize = 800
     scale = displaySize / mapSize
@@ -860,8 +1044,79 @@ def displayMap():
 
     rx = int(robotX * scale)
     ry = int(robotY * scale)
+
     botRadiusDisplay = max(3, int(botRadius * scale))
-    cv2.circle(display, (rx, ry), botRadiusDisplay, (0, 255, 0), -1)
+    botSize = botRadiusDisplay * 2
+
+    # rx = int(robotX * scale)
+    # ry = int(robotY * scale)
+    # botRadiusDisplay = max(3, int(botRadius * scale))
+    # cv2.circle(display, (rx, ry), botRadiusDisplay, (0, 255, 0), -1)
+
+    #horse code
+
+    if photo is not None:
+
+        # Resize robot image
+        botImage = cv2.resize(
+            photo,
+            (botSize, botSize),
+            interpolation=cv2.INTER_AREA
+        )
+
+        # Rotate image to match robot heading
+        # Assumes bot.png faces RIGHT at zero degrees
+        angleDegrees = np.rad2deg(robotAngle)
+
+        center = (botSize / 2, botSize / 2)
+
+        rotationMatrix = cv2.getRotationMatrix2D(
+            center,
+            angleDegrees,
+            1.0
+        )
+
+        botImage = cv2.warpAffine(
+            botImage,
+            rotationMatrix,
+            (botSize, botSize),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0, 0)
+        )
+
+        # Position image centred on robot
+        x1 = rx - botRadiusDisplay
+        y1 = ry - botRadiusDisplay
+        x2 = x1 + botSize
+        y2 = y1 + botSize
+
+        # Draw only if image fits within display
+        if x1 >= 0 and y1 >= 0 and x2 <= displaySize and y2 <= displaySize:
+
+            roi = display[y1:y2, x1:x2]
+
+            if botImage.shape[2] == 4:
+                # PNG transparency
+                alpha = botImage[:, :, 3:4] / 255.0
+
+                roi[:] = (
+                    alpha * botImage[:, :, :3]
+                    + (1 - alpha) * roi
+                ).astype(np.uint8)
+
+            else:
+                roi[:] = botImage[:, :, :3]
+
+    else:
+        # Fallback if image is missing
+        cv2.circle(
+            display,
+            (rx, ry),
+            botRadiusDisplay,
+            (0, 255, 0),
+            -1
+        )
 
     arrowLength = max(12, int(100 * scale))
     endPoint = (
@@ -887,7 +1142,13 @@ def displayMap():
 
     cv2.imshow("Robot Map", display)
     key = cv2.waitKey(1) & 0xFF
-
+    if key == ord('m'):
+        global manualMode
+        manualMode = not manualMode
+        if manualMode:
+            print("MANUAL MODE ON - Click a blue frontier")
+        else:
+            print("MANUAL MODE CANCELLED")
     if key == ord('t'):
         testMode = not testMode
         print("Super Duper fast" if testMode else "normal speed")
@@ -1668,6 +1929,9 @@ while not wsConnected:
 updateTime = time.perf_counter()
 lastDisplay = updateTime
 timeInterval = 1/15
+
+cv2.namedWindow("Robot Map", cv2.WINDOW_AUTOSIZE)
+cv2.setMouseCallback("Robot Map", onMapMouse)
 
 try:
     while True:
